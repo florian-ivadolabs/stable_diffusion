@@ -1,0 +1,5 @@
+tqdm
+Pillow
+transformers
+diffusers
+scipy
