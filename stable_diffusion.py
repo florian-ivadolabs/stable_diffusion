@@ -1,4 +1,3 @@
-from email.mime import audio
 from typing import List, Union
 from enum import Enum, auto
 
@@ -43,7 +42,7 @@ class StableDiffusion:
         self,
         weights: str = "CompVis/stable-diffusion-v1-4",
         scheduler: Scheduler = Scheduler.PNDM,
-        torch_device: str = "mps",
+        torch_device: Union[None, str] = None,
     ) -> None:
         # remove warning when loading models
         logging.set_verbosity_error()
@@ -81,9 +80,17 @@ class StableDiffusion:
         logging.set_verbosity_warning()
 
         self.torch_device = torch_device
-        self.vae = self.vae.to(torch_device)
-        self.text_encoder = self.text_encoder.to(torch_device)
-        self.unet = self.unet.to(torch_device)
+        if self.torch_device is None:
+            if torch.cuda.is_available():
+                self.torch_device = "cuda"
+            elif torch.has_mps:
+                self.torch_device = "mps"
+            else:
+                self.torch_device = "cpu"
+                
+        self.vae = self.vae.to(self.torch_device)
+        self.text_encoder = self.text_encoder.to(self.torch_device)
+        self.unet = self.unet.to(self.torch_device)
 
     def generate_image(
         self,
@@ -184,9 +191,8 @@ class StableDiffusion:
             offset = 1
             init_timestep = int(num_steps * init_strength) + offset
             init_timestep = min(init_timestep, num_steps)
-            timesteps = self.scheduler.timesteps[-init_timestep].type(torch.long)  # .to(self.torch_device)
+            timesteps = self.scheduler.timesteps[-init_timestep].type(torch.long)
             timesteps = torch.tensor([timesteps] * batch_size, dtype=torch.long)
-            timesteps = timesteps  # .to(self.torch_device)
 
             # add noise to latents using the timesteps
             init_latents = self.scheduler.add_noise(init_latents, noise, timesteps).to(self.torch_device)
