@@ -14,21 +14,7 @@ from diffusers import (
 )
 from diffusers.models.attention import BasicTransformerBlock
 from tqdm.auto import tqdm
-
-
-def mps_fix():
-    """force tensor to be contiguous before attention call"""
-
-    if not hasattr(BasicTransformerBlock, "forward_original"):
-        BasicTransformerBlock.forward_original = BasicTransformerBlock.forward
-
-        def contiguous_forward(self, x, context=None):
-            return self.forward_original(x.contiguous(), context=context)
-
-        BasicTransformerBlock.forward = contiguous_forward
-
-
-mps_fix()
+from time import time
 
 
 class Scheduler(Enum):
@@ -40,7 +26,7 @@ class Scheduler(Enum):
 class StableDiffusion:
     def __init__(
         self,
-        weights: str = "CompVis/stable-diffusion-v1-4",
+        weights: str = "CompVis/stable-diffusion-v1-4", 
         scheduler: Scheduler = Scheduler.PNDM,
         torch_device: Union[None, str] = None,
     ) -> None:
@@ -51,8 +37,9 @@ class StableDiffusion:
         self.vae = AutoencoderKL.from_pretrained(weights, subfolder="vae", use_auth_token=True)
 
         # 2. Load the tokenizer and text encoder to tokenize and encode the text.
-        self.tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
-        self.text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
+        clip_weight = "openai/clip-vit-large-patch14"
+        self.tokenizer = CLIPTokenizer.from_pretrained(clip_weight)
+        self.text_encoder = CLIPTextModel.from_pretrained(clip_weight)
 
         # 3. The UNet model for generating the latents.
         self.unet = UNet2DConditionModel.from_pretrained(weights, subfolder="unet", use_auth_token=True)
@@ -92,9 +79,11 @@ class StableDiffusion:
         self.text_encoder = self.text_encoder.to(self.torch_device)
         self.unet = self.unet.to(self.torch_device)
 
+    @torch.no_grad()
     def generate_image(
         self,
         prompts: Union[str, List[str]],
+        guiding_prompt: str = "",
         init_image: Union[None, str, Image.Image, torch.FloatTensor] = None,
         init_mask: Union[None, str, Image.Image, torch.FloatTensor] = None,
         init_strength: float = 0.8,
@@ -109,6 +98,7 @@ class StableDiffusion:
 
 
         :param prompts: List of prompts
+        :param guiding_prompt: String guiding the denoising
         :param init_image: Image to initialize noise of diffuser (disabled if None)
         :param init_mask: Mask to define in painting (disabled if None)
         :param init_strength: Ratio of steps to dedicate to noising initialization image (only if init_image != None)
@@ -140,19 +130,17 @@ class StableDiffusion:
             truncation=True,
             return_tensors="pt",
         )
-        with torch.no_grad():
-            text_embeddings = self.text_encoder(text_input.input_ids.to(self.torch_device))[0]
+        text_embeddings = self.text_encoder(text_input.input_ids.to(self.torch_device))[0]
         max_length = text_input.input_ids.shape[-1]
 
         # Tokenize an empty prompt and encode it to get the embeddings
         uncond_input = self.tokenizer(
-            [""] * batch_size,
+            [guiding_prompt] * batch_size,
             padding="max_length",
             max_length=max_length,
             return_tensors="pt",
         )
-        with torch.no_grad():
-            uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(self.torch_device))[0]
+        uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(self.torch_device))[0]
 
         # Embeddings to condition the U-Net is the concat of both
         text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
@@ -180,8 +168,8 @@ class StableDiffusion:
                 init_image = self.image_to_tensor(init_image, h=height, w=width)
 
             # encode the init image into latents and scale the latents
-            init_latents = self.vae.encode(init_image.to(self.torch_device)).sample()
-            init_latents = 0.18215 * init_latents.cpu()
+            init_latents = self.vae.encode(init_image.to(self.torch_device)).latent_dist.sample(generator=generator)
+            init_latents *= 0.18215
 
             # prepare init_latents noise to latents
             init_latents = torch.cat([init_latents] * batch_size)
@@ -195,7 +183,7 @@ class StableDiffusion:
             timesteps = torch.tensor([timesteps] * batch_size, dtype=torch.long)
 
             # add noise to latents using the timesteps
-            init_latents = self.scheduler.add_noise(init_latents, noise, timesteps).to(self.torch_device)
+            init_latents = self.scheduler.add_noise(init_latents.cpu(), noise, timesteps).to(self.torch_device)
 
             # prepare mask
             if init_mask is not None:
@@ -231,13 +219,13 @@ class StableDiffusion:
 
             # Expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
             latent_model_input = torch.cat([latents] * 2)
+
             if hasattr(self.scheduler, "sigmas"):
                 sigma = self.scheduler.sigmas[i]
                 latent_model_input = latent_model_input / ((sigma**2 + 1) ** 0.5)
 
             # Predict the noise residual
-            with torch.no_grad():
-                noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings)["sample"]
+            noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
 
             # Perform guidance (as the latent has both guided and not, we split them here)
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -247,22 +235,23 @@ class StableDiffusion:
             step = t
             if hasattr(self.scheduler, "sigmas"):
                 step = i + t_start
-            latents = self.scheduler.step(noise_pred, step, latents)["prev_sample"]
+            latents = self.scheduler.step(noise_pred, step, latents).prev_sample
 
             # masking
             if init_mask is not None:
                 init_latents_proper = self.scheduler.add_noise(init_latents_orig, noise, step)
+                # init_latents_proper = init_latents_orig
                 latents = (init_latents_proper * init_mask) + (latents * (1 - init_mask))
 
         return self.latent_to_image_list(latents)
 
+    @torch.no_grad()
     def latent_to_image_list(self, latents):
         """Scale and decode the image latents with vae"""
-        latents = 1 / 0.18215 * latents
+        latents /= 0.18215
 
         # Decode latent
-        with torch.no_grad():
-            image = self.vae.decode(latents)
+        image = self.vae.decode(latents).sample
 
         return self.tensor_to_image_list(image)
 

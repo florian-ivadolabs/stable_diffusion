@@ -130,3 +130,5 @@ dmypy.json
 
 # Photoshop
 *.psd
+tmp/
+output/

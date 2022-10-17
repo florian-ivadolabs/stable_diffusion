@@ -1,5 +1,6 @@
 tqdm
 Pillow
 transformers
-diffusers
+diffusers>=0.3.0
 scipy
+jupyterlab
